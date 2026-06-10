@@ -28,6 +28,18 @@ function makeSelection(counting, strictCounting, defaultExpand) {
     
     var fullScore= false    
 
+    /// MuseScore 4.7 no longer guarantees el.notes is ordered low->high by pitch.
+    /// This returns the chord's note objects sorted by pitch ascending so that
+    /// index 0 is always the lowest pitch, matching how "level" is computed.
+    function sortedNotes(chord){
+        var arr=[]
+        for (var k in chord.notes){
+            arr.push(chord.notes[k])
+        }
+        arr.sort(function(a,b){return a.pitch-b.pitch})
+        return arr
+    }
+
     var cursor = curScore.newCursor();               
     var els = curScore.selection.elements 
 
@@ -39,22 +51,44 @@ function makeSelection(counting, strictCounting, defaultExpand) {
         var track = els[i].track
         var staff = ~~(track/4)  
         var voice = track%4        
-        var tick = els[i].parent.parent.tick       
+        /// In 4.7 the element parent chain / tick exposure changed. Prefer the
+        /// segment tick via the chord's parent, but fall back gracefully.
+        var chord = els[i].parent
+        var tick
+        if (chord && chord.parent && chord.parent.tick !== undefined) {
+            tick = chord.parent.tick           /// note -> chord -> segment.tick
+        } else if (chord && chord.tick !== undefined) {
+            tick = chord.tick                  /// chord.tick directly
+        } else {
+            tick = els[i].parent.parent.tick   /// original behaviour
+        }
 
         var pitch=els[i].pitch
-        var chord = els[i].parent
         
         console.log("els["+i+"]: "+els[i].userName());
-        
+
+        /// MuseScore 4.7 no longer guarantees chord.notes is sorted by pitch
+        /// (low->high). Build an explicit pitch-sorted list so "level" is stable
+        /// across versions. sortedPitches[0] is always the lowest pitch.
+        var sortedPitches=[]
         for (var n in chord.notes){
-            if (pitch==chord.notes[n].pitch){                   
-                if (counting=="up") {var level = n} 
-                if (counting=="down") {var level = chord.notes.length-1-n}  
-                if (!strictCounting && (level==chord.notes.length-1)) {
-                    level=100  /// special number for bottom or top notes -depending on counting direction
-                }
-            }                
-        }  
+            sortedPitches.push(chord.notes[n].pitch)
+        }
+        sortedPitches.sort(function(a,b){return a-b})
+
+        var pitchIndex=-1
+        for (var p in sortedPitches){
+            if (sortedPitches[p]==pitch){
+                pitchIndex=~~p   /// index in low->high order
+            }
+        }
+
+        var level
+        if (counting=="up") {level = pitchIndex}
+        if (counting=="down") {level = sortedPitches.length-1-pitchIndex}
+        if (!strictCounting && (level==sortedPitches.length-1)) {
+            level=100  /// special number for bottom or top notes -depending on counting direction
+        }
         note = {staff:staff, voice:voice, track:track, level:level, tick:tick}  
         Notes.push(note)       
     }       
@@ -103,7 +137,7 @@ function makeSelection(counting, strictCounting, defaultExpand) {
                 }
             }
         } 
-        lev.sort()         
+        lev.sort(function(a,b){return a-b})         
         levels.push(lev)
     }
 
@@ -178,117 +212,42 @@ function makeSelection(counting, strictCounting, defaultExpand) {
             var copy=false
         }            
     }
-    
-    curScore.startCmd()
+
     /////////////////////////////////////////////////////////
-    if (copy==true){
-        var notesDeleted=0
-        for(var s in staves){
-            for (var v=0; v<4; v++){
-                var track=staves[s]*4+v
-                cursor.track=track
-                cursor.rewindToTick(t1)
-                if (voices[s].some(function(x){return x==v})){
-                    var trackIdx= tracks.indexOf(track)
-                    console.log(levels[trackIdx])
-                    while (cursor.segment && (cursor.tick < t2)) {   /// selects notes with same levels on the same track
-                        var el= cursor.element
-                        if(el.type == Element.CHORD) {
-                            for (var n= el.notes.length-1; n>=0; n--){                                   
-                                var levelsensor=0
-                                if (levels[trackIdx].some(function(x){return x==n})){                                         
-                                    levelsensor++
-                                }
-                                if (n==el.notes.length-1 && levels[trackIdx].some(function(x){return x==100})){  /// check for top or bottom note
-                                    levelsensor++
-                                }
-                                if (levelsensor==0){
-                                        if (counting=="up") {el.remove(el.notes[n])}  
-                                        if (counting=="down") {el.remove(el.notes[el.notes.length-1-n])}  
-                                        notesDeleted++
-                                } 
-                            }
+    /// Non-destructive selection only.
+    ///
+    /// The original plugin temporarily deleted the non-matching notes, ran
+    /// cmd("copy"), then cmd("undo") to restore them. In MuseScore 4.7 a
+    /// plugin window holds focus with UI context UiCtxUnknown, so cmd()
+    /// actions (including "undo" and "copy") silently do nothing. That left
+    /// the temporary deletions permanently applied to the score.
+    ///
+    /// Since the goal is only to *select* every note matching the chosen
+    /// level/voice condition, we skip the whole delete/copy/undo dance and
+    /// just build the selection directly. This never modifies the score, so
+    /// it is robust across versions. (The `copy` flag is kept for reference
+    /// but no longer drives a destructive branch.)
+    for (var i in tracks){                
+        cursor.track=tracks[i]
+        cursor.rewindToTick(t1)
+        if (cursor.element){
+            while (cursor.segment && (cursor.tick < t2)) {   /// selects notes with same levels on the same track
+                var el= cursor.element
+                if(el.type == Element.CHORD) {                    
+                    var sn= sortedNotes(el)   /// low->high by pitch
+                    for (var n=0; n<sn.length; n++) { 
+                        if (levels[i].some(function(x){return x==n})){                           
+                            if (counting=="up") {curScore.selection.select(sn[n], true)}  
+                            if (counting=="down") {curScore.selection.select(sn[sn.length-1-n], true)}  
                         }
-                        cursor.next()   
-                    }                                                
-                }
-
-                if (!voices[s].some(function(x){return x==v})){           /// if voice wasnt in selection but exists, delete it.            
-                    while (cursor.segment && (cursor.tick < t2)) {   
-                        var el= cursor.element
-                        if(el.type == Element.CHORD) {                    
-                            removeElement(el)
-                            notesDeleted++
-                            if(v!=0){
-                                var el= cursor.element                                                
-                                removeElement(el)
-                                notesDeleted++
-                            }                                
-                        }
-                        cursor.next()
                     }
+                    if (levels[i].some(function(x){return x==100})){   /// check top or bottom note 
+                        if (counting=="down") {curScore.selection.select(sn[0], true)}
+                        if (counting=="up") { curScore.selection.select(sn[sn.length-1], true)}
+                    }                           
                 }
-                
-            }///end voices iteration
-        }///end staves iteration
-
-        curScore.endCmd();                       
-        curScore.selection.selectRange(t1, t2, staves[0], staves[staves.length-1]+1);   
-        cmd("copy");
-        if (notesDeleted>0) {
-            cmd("undo");    ///dont want it to undo if no notes where deleted, otherwise it will undo preveious action in history, whatever that was
-        }
-        
-
-        for (var i in tracks){                
-            cursor.track=tracks[i]
-            cursor.rewindToTick(t1)
-            if (cursor.element){
-                while (cursor.segment && (cursor.tick < t2)) {   /// selects notes with same levels on the same track
-                    var el= cursor.element
-                    if(el.type == Element.CHORD) {                    
-                        for (var n in el.notes){                                
-                            if (levels[i].some(function(x){return x==n})){ 
-                                if (counting=="up") {curScore.selection.select(el.notes[n], true) }      
-                                if (counting=="down") {curScore.selection.select(el.notes[el.notes.length-1-n], true) }    
-                            }                                
-                        }
-                        if (levels[i].some(function(x){return x==100})){   /// check top or bottom note 
-                            if (counting=="down") {curScore.selection.select(el.notes[0], true)}
-                            if (counting=="up") {curScore.selection.select(el.notes[el.notes.length-1], true)}
-                        }   
-                    } 
-                    cursor.next()   
-                }
+                cursor.next()   
             }
         }
-
-
-    }
-
-    if (copy==false){
-        for (var i in tracks){                
-            cursor.track=tracks[i]
-            cursor.rewindToTick(t1)
-            if (cursor.element){
-                while (cursor.segment && (cursor.tick < t2)) {   /// selects notes with same levels on the same track
-                    var el= cursor.element
-                    if(el.type == Element.CHORD) {                    
-                        for (var n in el.notes) { 
-                            if (levels[i].some(function(x){return x==n})){                           
-                                if (counting=="up") {curScore.selection.select(el.notes[n], true)}  
-                                if (counting=="down") {curScore.selection.select(el.notes[el.notes.length-1-n], true)}  
-                            }
-                        }
-                        if (levels[i].some(function(x){return x==100})){   /// check bottom note 
-                            if (counting=="down") {curScore.selection.select(el.notes[0], true)}
-                            if (counting=="up") { curScore.selection.select(el.notes[el.notes.length-1], true)}
-                        }                           
-                    }
-                    cursor.next()   
-                }
-            }
-        }
-        curScore.endCmd()
     }
 }
